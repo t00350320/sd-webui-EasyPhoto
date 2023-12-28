@@ -82,6 +82,57 @@ def compare_jpg_with_face_id(embedding_list):
     scores = [np.dot(emb, pivot_feature)[0][0] for emb in embedding_list]
     return scores
 
+def get_mask_head(result, need_hair = True):
+    masks = result['masks']
+    scores = result['scores']
+    labels = result['labels']
+    h, w = np.shape(masks[0])
+    mask_hair = np.zeros((h, w))
+    mask_face = np.zeros((h, w))
+    mask_human = np.zeros((h, w))
+    for i in range(len(labels)):
+        if scores[i] > 0.8:
+            if labels[i] == 'Face':
+                if np.sum(masks[i]) > np.sum(mask_face):
+                    mask_face = masks[i]
+            elif labels[i] == 'Human':
+                if np.sum(masks[i]) > np.sum(mask_human):
+                    mask_human = masks[i]
+            elif labels[i] == 'Hair':
+                if np.sum(masks[i]) > np.sum(mask_hair):
+                    mask_hair = masks[i]
+    
+    #crop hair eara
+    #print(mask_face)
+    indices = np.transpose(np.where(mask_face == 1))
+    points = indices.tolist()
+    #print(points)
+    y_values = [point[0] for point in points]
+    min_y = min(y_values)
+    max_y = max(y_values)
+    expand_y = (max_y - min_y) // 20
+    #mask_hair[(max_y + expand_y):, :] = 0
+    #mask_hair[max_y:, :] = 0
+
+    if need_hair:
+        mask_head = np.clip(mask_hair + mask_face, 0, 1)
+    else:
+        mask_head = mask_face
+    ksize = max(int(np.sqrt(np.sum(mask_face)) / 20), 1)
+    kernel = np.ones((ksize, ksize))
+    mask_head = cv2.dilate(mask_head, kernel, iterations=1) * mask_human
+    _, mask_head = cv2.threshold((mask_head * 255).astype(np.uint8), 127, 255, cv2.THRESH_BINARY)
+    contours, hierarchy = cv2.findContours(mask_head, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    area = []
+    for j in range(len(contours)):
+        area.append(cv2.contourArea(contours[j]))
+    max_idx = np.argmax(area)
+    mask_head = np.zeros((h, w)).astype(np.uint8)
+    cv2.fillPoly(mask_head, [contours[max_idx]], 255)
+    mask_head = mask_head.astype(np.float32) / 255
+    mask_head = np.clip(mask_head + mask_face, 0, 1)
+    mask_head = np.expand_dims(mask_head, 2)
+    return mask_head
 
 if __name__ == "__main__":
     args = parse_args()
@@ -91,6 +142,7 @@ if __name__ == "__main__":
     inputs_dir = args.inputs_dir
     ref_image_path = args.ref_image_path
     skin_retouching_bool = args.skin_retouching_bool
+	facecrop_method     = "fc"
     train_scene_lora_bool = args.train_scene_lora_bool
 
     logging.info(
@@ -110,7 +162,11 @@ if __name__ == "__main__":
     # face detection
     retinaface_detection = pipeline(Tasks.face_detection, "damo/cv_resnet50_face-detection_retinaface", model_revision="v2.0.2")
     # semantic segmentation
-    salient_detect = pipeline(Tasks.semantic_segmentation, "damo/cv_u2net_salient-detection", model_revision="v1.0.0")
+    # salient_detect          = pipeline(Tasks.semantic_segmentation, 'damo/cv_u2net_salient-detection', model_revision='v1.0.0')
+    segmentation_pipeline = pipeline(Tasks.image_segmentation, 'damo/cv_resnet101_image-multiple-human-parsing', model_revision='v1.0.1')
+    fair_face_attribute_func = pipeline(Tasks.face_attribute_recognition, 'damo/cv_resnet34_face-attribute-recognition_fairface', model_revision='v2.0.2')
+    facial_landmark_confidence_func = pipeline(Tasks.face_2d_keypoints, 'damo/cv_manual_facial-landmark-confidence_flcm', model_revision='v2.5')
+
     # skin retouching
     try:
         skin_retouching = pipeline("skin-retouching-torch", model="damo/cv_unet_skin_retouching_torch", model_revision="v1.0.2")
@@ -135,6 +191,7 @@ if __name__ == "__main__":
         copy_jpgs = []
         selected_paths = []
         sub_images = []
+        genders = []
         for index, jpg in enumerate(tqdm(jpgs)):
             try:
                 if not jpg.lower().endswith((".bmp", ".dib", ".png", ".jpg", ".jpeg", ".pbm", ".pgm", ".ppm", ".tif", ".tiff")):
@@ -165,7 +222,18 @@ if __name__ == "__main__":
 
                 # face crop
                 sub_image = image.crop(retinaface_box)
-                if skin_retouching_bool:
+	            # sub image too large
+	            w, h = sub_image.size
+	            if max(w ,h) > 3072:
+	                sub_image = sub_image.resize((w//2,h//2),Image.ANTIALIAS)
+	            tmp_path = os.path.join(images_save_path, 'tmp.png')
+	            sub_image.save(tmp_path)
+	            # gender detect
+	            attribute_result = fair_face_attribute_func(tmp_path)
+	            score_gender = np.array(attribute_result['scores'][0])
+	            gender = np.argmax(score_gender)
+	            genders.append(gender)
+	            if gender == 0 or skin_retouching_bool:
                     try:
                         sub_image = Image.fromarray(cv2.cvtColor(skin_retouching(sub_image)[OutputKeys.OUTPUT_IMG], cv2.COLOR_BGR2RGB))
                     except Exception as e:
@@ -220,33 +288,61 @@ if __name__ == "__main__":
                     torch.cuda.empty_cache()
                     logging.error(f"Photo enhance error, error info: {e}")
 
-                # Correct the mask area of the face
-                sub_boxes, _, sub_masks = call_face_crop(retinaface_detection, sub_image, 1, prefix="tmp")
-                sub_box = sub_boxes[0]
-                sub_mask = sub_masks[0]
+	            if facecrop_method == "ep":
+	                # Correct the mask area of the face
+	                sub_boxes, _, sub_masks = call_face_crop(retinaface_detection, sub_image, 1, prefix="tmp")
+	                sub_box = sub_boxes[0]
+	                sub_mask = sub_masks[0]
 
-                h, w, c = np.shape(sub_mask)
-                face_width = sub_box[2] - sub_box[0]
-                face_height = sub_box[3] - sub_box[1]
-                sub_box[0] = np.clip(np.array(sub_box[0], np.int32) - face_width * 0.3, 1, w - 1)
-                sub_box[2] = np.clip(np.array(sub_box[2], np.int32) + face_width * 0.3, 1, w - 1)
-                sub_box[1] = np.clip(np.array(sub_box[1], np.int32) + face_height * 0.15, 1, h - 1)
-                sub_box[3] = np.clip(np.array(sub_box[3], np.int32) + face_height * 0.15, 1, h - 1)
-                sub_mask = np.zeros_like(np.array(sub_mask, np.uint8))
-                sub_mask[sub_box[1] : sub_box[3], sub_box[0] : sub_box[2]] = 1
+	                h, w, c = np.shape(sub_mask)
+	                face_width = sub_box[2] - sub_box[0]
+	                face_height = sub_box[3] - sub_box[1]
+	                sub_box[0] = np.clip(np.array(sub_box[0], np.int32) - face_width * 0.3, 1, w - 1)
+	                sub_box[2] = np.clip(np.array(sub_box[2], np.int32) + face_width * 0.3, 1, w - 1)
+	                sub_box[1] = np.clip(np.array(sub_box[1], np.int32) + face_height * 0.15, 1, h - 1)
+	                sub_box[3] = np.clip(np.array(sub_box[3], np.int32) + face_height * 0.15, 1, h - 1)
+	                sub_mask = np.zeros_like(np.array(sub_mask, np.uint8))
+	                sub_mask[sub_box[1] : sub_box[3], sub_box[0] : sub_box[2]] = 1
 
-                # Significance detection, merging facial masks
-                result = salient_detect(sub_image)[OutputKeys.MASKS]
-                mask = np.float32(np.expand_dims(result > 128, -1)) * sub_mask
+	                # Significance detection, merging facial masks
+	                result = salient_detect(sub_image)[OutputKeys.MASKS]
+	                mask = np.float32(np.expand_dims(result > 128, -1)) * sub_mask
 
-                # Obtain the image after the mask
-                mask_sub_image = np.array(sub_image) * np.array(mask) + np.ones_like(sub_image) * 255 * (1 - np.array(mask))
-                mask_sub_image = Image.fromarray(np.uint8(mask_sub_image))
-                if np.sum(np.array(mask)) != 0:
-                    images.append(mask_sub_image)
-            except Exception as e:
-                torch.cuda.empty_cache()
-                logging.error(f"Photo face crop and salient_detect error, error info: {e}")
+	                # Obtain the image after the mask
+	                mask_sub_image = np.array(sub_image) * np.array(mask) + np.ones_like(sub_image) * 255 * (1 - np.array(mask))
+	                mask_sub_image = Image.fromarray(np.uint8(mask_sub_image))
+	            elif facecrop_method == "fc":
+	                sub_image.save(tmp_path)
+	                tmp2_path = os.path.join(images_save_path, 'tmp2.png') 
+	                result = segmentation_pipeline(tmp_path)
+	                #print("result is", result)
+	                #print(np.shape(result["masks"][0]))
+	                need_hair = True if genders[index] == 0 else False
+	                mask = get_mask_head(result, need_hair)
+	                im = cv2.imread(tmp_path)
+	                mask_image = im * mask + 255 * (1 - mask)
+	                raw_result = facial_landmark_confidence_func(mask_image)
+	                if raw_result is None:
+	                    print('landmark quality fail...')
+	                    continue
+
+	                #print("score is", raw_result['scores'][0])
+	                if float(raw_result['scores'][0]) < (1 - 0.145):
+	                    print('landmark quality fail...')
+	                    continue
+	                #cv2.imwrite(tmp2_path, mask_image)
+	                #print(mask_image.shape)
+	                mask_sub_image = Image.fromarray(cv2.cvtColor(np.uint8(mask_image),cv2.COLOR_BGR2RGB))
+	            if np.sum(np.array(mask)) != 0:
+	                    images.append(mask_sub_image)
+	    	except Exception as e:
+	                torch.cuda.empty_cache()
+					logging.error(f"Photo face crop and salient_detect error, error info: {e}")
+
+	    try:
+	        os.remove(tmp_path)
+	    except OSError as e:
+	        print(f"Failed to remove path {tmp_path}: {e}")
     else:
         # jpg list
         jpgs = os.listdir(inputs_dir)
@@ -355,7 +451,7 @@ if __name__ == "__main__":
                         f.write("\n")
 
     del retinaface_detection
-    del salient_detect
+    # del salient_detect
     del skin_retouching
     del portrait_enhancement
     del face_recognition
